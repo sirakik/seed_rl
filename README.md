@@ -1,1 +1,1 @@
-It's just a copy of .
+It's just a copy of SEED RL.
