@@ -4,7 +4,7 @@ It's just a copy of [SEED RL](https://github.com/google-research/seed_rl).
 ---
 ``apt-get install git``
 
-``git clone https://github.com/google-research/seed_rl.git``  
+``git clone https://github.com/sirakik/seed_rl_shirakik.git``  
 
 ``cd seed_rl``
 
