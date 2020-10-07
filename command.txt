@@ -1,1 +1,1 @@
-!bash train.sh football vtrace 4 '--total_environment_frames=10000 --game=11_vs_11_kaggle --reward_experiment=scoring,checkpoints --logdir=/kaggle_simulations/agent/'
+bash train.sh football vtrace 4 '--total_environment_frames=10000 --game=11_vs_11_kaggle --reward_experiment=scoring,checkpoints --logdir=/kaggle_simulations/agent/'
