@@ -13,7 +13,6 @@
 
 #include <functional>
 #include <memory>
-#include <utility>
 #include <vector>
 
 #include "grpcpp/grpcpp.h"
@@ -79,6 +78,7 @@ REGISTER_OP("GrpcServerBind")
     .Attr("input_shapes: list(shape)")
     .Attr("output_shapes: list(shape)")
     .Attr("output_specs: string")
+    .Attr("batched: bool")
     .Attr("first_bind: bool")
     .SetShapeFn(shape_inference::NoOutputs)
     .Doc(R"doc(
@@ -511,7 +511,6 @@ REGISTER_KERNEL_BUILDER(Name("CreateGrpcServer").Device(DEVICE_CPU),
 
 Status verify_args(const DataTypeVector& expected_arg_types,
                    const std::vector<TensorShape>& expected_arg_shapes,
-                   int batching_dims_count,
                    gtl::ArraySlice<Tensor> actual_args) {
   unsigned int num_expected_arguments = expected_arg_types.size();
   if (num_expected_arguments != actual_args.size()) {
@@ -521,20 +520,11 @@ Status verify_args(const DataTypeVector& expected_arg_types,
   }
 
   for (unsigned int i = 0; i < actual_args.size(); ++i) {
-    if (expected_arg_shapes[i].dims() + batching_dims_count !=
-        actual_args[i].shape().dims()) {
-      return errors::InvalidArgument(
-          "Expects arg[", i, "] to have shape with ",
-          expected_arg_shapes[i].dims() + batching_dims_count,
-          " dimension(s), but had shape ",
-          actual_args[i].shape().DebugString());
-    }
-    if (!TensorShapeUtils::EndsWith(actual_args[i].shape(),
-                                    expected_arg_shapes[i])) {
-      return errors::InvalidArgument(
-          "Expects arg[", i, "] to have shape with suffix ",
-          expected_arg_shapes[i].DebugString(), ", but had shape ",
-          actual_args[i].shape().DebugString());
+    if (expected_arg_shapes[i] != actual_args[i].shape()) {
+      return errors::InvalidArgument("Expects arg[", i, "] to have shape ",
+                                     expected_arg_shapes[i].DebugString(),
+                                     " but had shape ",
+                                     actual_args[i].shape().DebugString());
     }
 
     if (expected_arg_types[i] != actual_args[i].dtype()) {
@@ -547,258 +537,23 @@ Status verify_args(const DataTypeVector& expected_arg_types,
   return Status::OK();
 }
 
-// Checks that @actual_args conform to the expected types and shapes.
-// Determines whether @actual_args are batched. Batched arguments have expected
-// shapes prefixed with the batching dimension. If the arguments do not
-// match expected types or shapes, returns an error status.
-// Otherwise, writes the batch size in @arg_batch_size.
-// If the arguments are not batched, writes 0 in @arg_batch_size.
-Status GetArgBatchSize(const DataTypeVector& expected_arg_types,
-                       const std::vector<TensorShape>& expected_arg_shapes,
-                       gtl::ArraySlice<Tensor> actual_args,
-                       int* arg_batch_size) {
-  const bool batched =
-      !actual_args.empty() && !expected_arg_shapes.empty() &&
-      actual_args[0].shape().dims() == expected_arg_shapes[0].dims() + 1;
-  const int batching_dims_count = batched ? 1 : 0;
-  const Status status = verify_args(expected_arg_types, expected_arg_shapes,
-                                    batching_dims_count, actual_args);
-  if (!status.ok()) {
-    return status;
-  }
-
-  if (!batched) {
-    *arg_batch_size = 0;
-    return Status::OK();
-  }
-
-  // Check that the batching dimension is the same for all arguments.
-  const int expected_batch_size = actual_args[0].shape().dim_size(0);
-  for (unsigned int i = 1; i < actual_args.size(); ++i) {
-    if (actual_args[i].shape().dim_size(0) != expected_batch_size) {
-      return errors::InvalidArgument("Expects arg[", i,
-                                     "] to start with the batching dimension ",
-                                     expected_batch_size, " but had shape ",
-                                     actual_args[i].shape().DebugString());
-    }
-  }
-
-  *arg_batch_size = expected_batch_size;
-  return Status::OK();
-}
-
-class DynamicFn : public FnType {
+class DirectFn : public FnType {
  public:
-  DynamicFn(FunctionLibraryRuntime* lib,
-            FunctionLibraryRuntime::Handle f_handle,
-            DataTypeVector&& input_types,
-            std::vector<TensorShape>&& input_shapes,
-            std::vector<Tensor>&& captures, GrpcServerResource* resource,
-            thread::ThreadPool* tp, bool batched)
+  DirectFn(FunctionLibraryRuntime* lib, FunctionLibraryRuntime::Handle f_handle,
+           DataTypeVector&& input_types,
+           std::vector<TensorShape>&& input_shapes,
+           std::vector<Tensor>&& captures, GrpcServerResource* resource)
       : lib_(lib),
         f_handle_(f_handle),
         input_types_(std::move(input_types)),
         input_shapes_(std::move(input_shapes)),
         captures_(std::move(captures)),
-        resource_(resource),
-        batch_size_(batched ? input_shapes_[0].dim_size(0) : -1),
-        tp_(tp),
-        mu_(new mutex()) {
-    if (batch_size_ != -1) {
-      for (auto shape : input_shapes_) {
-        shape.RemoveDim(0);
-        arg_shapes_.push_back(shape);
-      }
-      current_computation_ = BuildEmptyComputation();
-    }
-  }
-
-  ~DynamicFn() {
-    Shutdown();
-    delete current_computation_;
-  }
+        resource_(resource) {}
 
   bool operator()(
       ServerContext* server_ctx, gtl::ArraySlice<Tensor> args,
       std::function<void(Status, std::vector<Tensor>)> callback) override {
-    // Is this a direct call not involving server-side batching?
-    // Exact match of the argument shapes means it was batched by the client.
-    if (batch_size_ == -1 ||
-        (!args.empty() && args[0].shape() == input_shapes_[0])) {
-      return DirectCall(server_ctx, args, callback);
-    }
-
-    int arg_batch_size = 0;
-    Status status =
-        GetArgBatchSize(input_types_, arg_shapes_, args, &arg_batch_size);
-    if (!status.ok()) {
-      callback(status, {});
-      return false;
-    }
-    const bool args_batched = arg_batch_size > 0;
-    const int slice_count = args_batched ? arg_batch_size : 1;
-
-    int64 index;
-    Computation* computation = nullptr;
-    {
-      mutex_lock lock(*mu_);
-      CHECK(current_computation_);
-      index = next_index_;
-      next_index_ += slice_count;
-      computation = current_computation_;
-
-      // Note: it can happen that incoming batches have different sizes,
-      // in this case next_index_ can exceed batch_size_.
-
-      CHECK_LE(next_index_, batch_size_) << "Learner-side batch size exceeded";
-      if (next_index_ == batch_size_) {
-        next_index_ = 0;
-        if (!empty_computations_.empty()) {
-          current_computation_ = empty_computations_.back();
-          empty_computations_.pop_back();
-        } else {
-          current_computation_ = BuildEmptyComputation();
-        }
-      }
-    }
-
-    // Copy input tensors to the batched input tensors.
-    if (!args_batched) {
-      for (unsigned int i = 0; i < args.size(); ++i) {
-        TF_CHECK_OK(batch_util::CopyElementToSlice(
-            args[i], &computation->request[i], index));
-      }
-    } else {
-      for (unsigned int i = 0; i < args.size(); ++i) {
-        TF_CHECK_OK(batch_util::CopyContiguousSlices(
-            args[i], 0, index, arg_batch_size, &computation->request[i]));
-      }
-    }
-
-    // Populate the callback for the last slice in the batch.
-    computation->callbacks[index + slice_count - 1] = callback;
-
-    int num_ready = computation->num_ready += slice_count;
-    if (num_ready == batch_size_) {
-      // A full batch have been filled up, so the function should be executed.
-      FunctionLibraryRuntime::Options f_opts;
-      f_opts.create_rendezvous = true;
-      std::shared_ptr<CancellationManager> c_mgr = nullptr;
-      std::shared_ptr<std::function<void()>> deregister_fn = nullptr;
-      auto status =
-          resource_->create_child_cancellation_manager(&c_mgr, &deregister_fn);
-      CHECK(status.ok());
-      f_opts.cancellation_manager = c_mgr.get();
-      auto f_callback = [this, deregister_fn, computation, c_mgr,
-                         args_batched](Status f_status) {
-        (*deregister_fn)();
-        if (f_status.ok()) {
-          for (unsigned int i = 0; i < computation->outputs.size(); ++i) {
-            const auto& shape = computation->outputs[i].shape();
-            if (shape.dims() <= 0) {
-              f_status = errors::InvalidArgument(
-                  "Output must be at least rank 1 when batching is enabled");
-              break;
-            }
-
-            if (input_shapes_[0].dim_size(0) != shape.dim_size(0)) {
-              f_status = errors::InvalidArgument(
-                  "All outputs must have the same batch size "
-                  "as the inputs when batching is enabled, expected: ",
-                  input_shapes_[0].dim_size(0), " was: ", shape.dim_size(0));
-              break;
-            }
-          }
-        }
-
-        // Parallel call all callbacks with their slice of outputs in.
-        // Make sure computation is freed once callbacks are done.
-        std::shared_ptr<Computation> done_computation;
-        done_computation.reset(computation);
-        int prev_batch_limit = -1;
-        std::vector<std::pair<int, int>> batch_bounds;
-        for (int j = 0; j < batch_size_; j++) {
-          if (!computation->callbacks[j]) continue;
-          batch_bounds.push_back(std::make_pair(prev_batch_limit + 1, j + 1));
-          prev_batch_limit = j;
-        }
-
-        const int work_unit_size =
-            (batch_bounds.size() + workers_thread_pools - 1) /
-            workers_thread_pools;
-        for (int j = 0; j < batch_bounds.size(); j += work_unit_size) {
-          const int limit =
-              std::min<int>(j + work_unit_size, batch_bounds.size());
-          tp_->Schedule([j, done_computation, f_status, limit, batch_bounds,
-                         args_batched]() {
-            for (int x = j; x < limit; x++) {
-              const int batch_start = batch_bounds[x].first;
-              const int batch_limit = batch_bounds[x].second;
-              std::vector<Tensor> rets;
-              if (f_status.ok()) {
-                rets.reserve(done_computation->outputs.size());
-                // Pass the slice of the batched outputs to the return vector.
-                for (unsigned int i = 0; i < done_computation->outputs.size();
-                     ++i) {
-                  if (args_batched) {
-                    rets.push_back(done_computation->outputs[i].Slice(
-                        batch_start, batch_limit));
-                  } else {
-                    rets.push_back(
-                        done_computation->outputs[i].SubSlice(batch_start));
-                  }
-                }
-              }
-              // Callbacks are populated for the last slice in the batch.
-              done_computation->callbacks[batch_limit - 1](f_status, rets);
-            }
-          });
-        }
-      };
-      lib_->Run(f_opts, f_handle_, computation->request, &computation->outputs,
-                f_callback);
-      // Refill empty_computations_.
-      Computation* refill_comp = BuildEmptyComputation();
-      {
-        mutex_lock lock(*mu_);
-        empty_computations_.push_back(refill_comp);
-      }
-      return true;
-    }
-    return false;
-  }
-
-  void Shutdown() override {
-    mutex_lock lock(*mu_);
-    std::vector<Tensor> result;
-    if (current_computation_) {
-      for (auto& c : current_computation_->callbacks) {
-        if (c) {
-          c(errors::Cancelled("Server shutdown."), result);
-        }
-      }
-      delete current_computation_;
-      current_computation_ = BuildEmptyComputation();
-    }
-    for (auto c : empty_computations_) {
-      delete c;
-    }
-    empty_computations_.clear();
-  }
-
- private:
-  // Represents one batched computation.
-  struct Computation {
-    std::vector<Tensor> request;
-    std::vector<Tensor> outputs;
-    std::vector<std::function<void(Status, std::vector<Tensor>)>> callbacks;
-    std::atomic_int num_ready{0};
-  };
-
-  bool DirectCall(ServerContext* server_ctx, gtl::ArraySlice<Tensor> args,
-    std::function<void(Status, std::vector<Tensor>)> callback) {
-    Status status = verify_args(input_types_, input_shapes_,
-                                /*batching_dims_count=*/0, args);
+    Status status = verify_args(input_types_, input_shapes_, args);
     if (!status.ok()) {
       callback(status, {});
       return false;
@@ -829,6 +584,177 @@ class DynamicFn : public FnType {
               });
     return true;
   }
+
+  void Shutdown() override {}
+
+ private:
+  FunctionLibraryRuntime* lib_;
+  FunctionLibraryRuntime::Handle f_handle_;
+  const DataTypeVector input_types_;
+  const std::vector<TensorShape> input_shapes_;
+  const std::vector<Tensor> captures_;
+  GrpcServerResource* resource_;
+};
+
+class BatchedFn : public FnType {
+ public:
+  BatchedFn(FunctionLibraryRuntime* lib,
+            FunctionLibraryRuntime::Handle f_handle,
+            DataTypeVector&& input_types,
+            std::vector<TensorShape>&& input_shapes,
+            std::vector<Tensor>&& captures, GrpcServerResource* resource,
+            thread::ThreadPool* tp)
+      : lib_(lib),
+        f_handle_(f_handle),
+        input_types_(std::move(input_types)),
+        input_shapes_(std::move(input_shapes)),
+        captures_(std::move(captures)),
+        resource_(resource),
+        batch_size_(input_shapes_[0].dim_size(0)),
+        tp_(tp),
+        mu_(new mutex()) {
+    for (auto shape : input_shapes_) {
+      shape.RemoveDim(0);
+      arg_shapes_.push_back(shape);
+    }
+    current_computation_ = BuildEmptyComputation();
+  }
+
+  ~BatchedFn() {
+    Shutdown();
+    delete current_computation_;
+  }
+
+  bool operator()(
+      ServerContext* server_ctx, gtl::ArraySlice<Tensor> args,
+      std::function<void(Status, std::vector<Tensor>)> callback) override {
+    Status status = verify_args(input_types_, arg_shapes_, args);
+    if (!status.ok()) {
+      callback(status, {});
+      return false;
+    }
+
+    int64 index;
+    Computation* computation = nullptr;
+    {
+      mutex_lock lock(*mu_);
+      CHECK(current_computation_);
+      index = next_index_++;
+      computation = current_computation_;
+
+      if (index == batch_size_ - 1) {
+        next_index_ = 0;
+        if (!empty_computations_.empty()) {
+          current_computation_ = empty_computations_.back();
+          empty_computations_.pop_back();
+        } else {
+          current_computation_ = BuildEmptyComputation();
+        }
+      }
+    }
+
+    // Copy input tensors to the batched input tensors.
+    for (unsigned int i = 0; i < args.size(); ++i) {
+      TF_CHECK_OK(batch_util::CopyElementToSlice(
+          args[i], &computation->request[i], index));
+    }
+
+    computation->callbacks[index] = callback;
+
+    int num_ready = ++computation->num_ready;
+    if (num_ready == batch_size_) {
+      // A full batch have been filled up, so the function should be executed.
+      FunctionLibraryRuntime::Options f_opts;
+      f_opts.create_rendezvous = true;
+      std::shared_ptr<CancellationManager> c_mgr = nullptr;
+      std::shared_ptr<std::function<void()>> deregister_fn = nullptr;
+      auto status =
+          resource_->create_child_cancellation_manager(&c_mgr, &deregister_fn);
+      CHECK(status.ok());
+      f_opts.cancellation_manager = c_mgr.get();
+      auto f_callback = [this, deregister_fn, computation,
+                         c_mgr](Status f_status) {
+        (*deregister_fn)();
+        if (f_status.ok()) {
+          for (unsigned int i = 0; i < computation->outputs.size(); ++i) {
+            const auto& shape = computation->outputs[i].shape();
+            if (shape.dims() <= 0) {
+              f_status = errors::InvalidArgument(
+                  "Output must be at least rank 1 when batched=True");
+              break;
+            }
+
+            if (input_shapes_[0].dim_size(0) != shape.dim_size(0)) {
+              f_status = errors::InvalidArgument(
+                  "All outputs must have the same batch size "
+                  "as the inputs when batched=True, expected: ",
+                  input_shapes_[0].dim_size(0), " was: ", shape.dim_size(0));
+              break;
+            }
+          }
+        }
+
+        // Parallel call all callbacks with their slice of outputs in.
+        // Make sure computation is freed once callbacks are done.
+        std::shared_ptr<Computation> done_computation;
+        done_computation.reset(computation);
+        const int work_unit_size =
+            (batch_size_ + workers_thread_pools - 1) / workers_thread_pools;
+        for (int j = 0; j < batch_size_; j += work_unit_size) {
+          const int limit = std::min(j + work_unit_size, batch_size_);
+          tp_->Schedule([j, done_computation, f_status, limit]() {
+            for (int x = j; x < limit; x++) {
+              std::vector<Tensor> rets;
+              if (f_status.ok()) {
+                rets.reserve(done_computation->outputs.size());
+                // Pass the slice of the batched outputs to the return vector.
+                for (unsigned int i = 0; i < done_computation->outputs.size();
+                     ++i) {
+                  rets.push_back(done_computation->outputs[i].SubSlice(x));
+                }
+              }
+              done_computation->callbacks[x](f_status, rets);
+            }
+          });
+        }
+      };
+      lib_->Run(f_opts, f_handle_, computation->request, &computation->outputs,
+                f_callback);
+      // Refill empty_computations_.
+      Computation* refill_comp = BuildEmptyComputation();
+      {
+        mutex_lock lock(*mu_);
+        empty_computations_.push_back(refill_comp);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  void Shutdown() override {
+    mutex_lock lock(*mu_);
+    std::vector<Tensor> result;
+    for (auto& c : current_computation_->callbacks) {
+      if (c) {
+        c(errors::Cancelled("Server shutdown."), result);
+      }
+    }
+    delete current_computation_;
+    current_computation_ = BuildEmptyComputation();
+    for (auto c : empty_computations_) {
+      delete c;
+    }
+    empty_computations_.clear();
+  }
+
+ private:
+  // Represents one batched computation.
+  struct Computation {
+    std::vector<Tensor> request;
+    std::vector<Tensor> outputs;
+    std::vector<std::function<void(Status, std::vector<Tensor>)>> callbacks;
+    std::atomic_int num_ready{0};
+  };
 
   Computation* BuildEmptyComputation() {
     Computation* c = new Computation();
@@ -876,8 +802,42 @@ class GrpcServerBindOp : public OpKernel {
                     "Unable to parse StructuredValue output_spec string: ",
                     output_spec_string));
 
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("batched", &batched_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("first_bind", &first_bind_));
-    batched_ = CanBatch(output_shapes);
+
+    if (batched_) {
+      OP_REQUIRES(
+          ctx, !input_shapes_.empty(),
+          errors::InvalidArgument(
+              "Function must have at least one input when batched=True"));
+
+      for (auto& shape : input_shapes_) {
+        OP_REQUIRES(
+            ctx, shape.dims() > 0,
+            errors::InvalidArgument(
+                "All inputs must at least be rank 1 when batched=True"));
+        OP_REQUIRES(
+            ctx, input_shapes_[0].dim_size(0) == shape.dim_size(0),
+            errors::InvalidArgument("All inputs must have the same first "
+                                    "dimension when batched=True"));
+      }
+
+      for (auto& shape : output_shapes) {
+        OP_REQUIRES(
+            ctx, shape.dims() == -1 || shape.dims() > 0,
+            errors::InvalidArgument("All outputs must at least be rank 1 when "
+                                    "batched=True but rank was: ",
+                                    shape.dims()));
+        if (shape.dims() > 0 && shape.dim_size(0) != -1) {
+          OP_REQUIRES(
+              ctx, input_shapes_[0].dim_size(0) == shape.dim_size(0),
+              errors::InvalidArgument(
+                  "All outputs must have the same batch size "
+                  "as the inputs when batched=True, expected: ",
+                  input_shapes_[0].dim_size(0), " was: ", shape.dim_size(0)));
+        }
+      }
+    }
   }
 
   void Compute(OpKernelContext* ctx) override {
@@ -938,39 +898,20 @@ class GrpcServerBindOp : public OpKernel {
       output_types.push_back(output_arg.type());
     }
     std::unique_ptr<FnType> func;
-    func.reset(static_cast<FnType*>(new DynamicFn(
-        lib, f_handle, std::move(input_types), std::move(input_shapes_),
-        std::move(captures), resource, resource->func_tp.get(), batched_)));
+    if (batched_) {
+      func.reset(static_cast<FnType*>(new BatchedFn(
+          lib, f_handle, std::move(input_types), std::move(input_shapes_),
+          std::move(captures), resource, resource->func_tp.get())));
+    } else {
+      func.reset(static_cast<FnType*>(new DirectFn(
+          lib, f_handle, std::move(input_types), std::move(input_shapes_),
+          std::move(captures), resource)));
+    }
     OP_REQUIRES_OK(ctx, resource->tensor_handler()->Bind(
         fn_name_, output_specs_, std::move(func), first_bind_));
   }
 
  private:
-  bool CanBatch(const std::vector<PartialTensorShape>& output_shapes) {
-    if (input_shapes_.empty()) {
-      return false;
-    }
-    for (auto& shape : input_shapes_) {
-      if (shape.dims() <= 0) {
-        return false;
-      }
-      if (input_shapes_[0].dim_size(0) != shape.dim_size(0)) {
-        return false;
-      }
-    }
-    for (auto& shape : output_shapes) {
-      if (shape.dims() == 0) {
-        return false;
-      }
-      if (shape.dims() > 0 && shape.dim_size(0) != -1) {
-        if (input_shapes_[0].dim_size(0) != shape.dim_size(0)) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
   string fn_name_;
   NameAttrList fn_;
   std::vector<TensorShape> input_shapes_;

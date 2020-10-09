@@ -1,10 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="12899b9b-5b43-4732-bb5a-11251b7fce99" name="Default Changelist" comment="h">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/grpc/python/ops_wrapper.py" beforeDir="false" afterPath="$PROJECT_DIR$/grpc/python/ops_wrapper.py" afterDir="false" />
-    </list>
+    <list default="true" id="12899b9b-5b43-4732-bb5a-11251b7fce99" name="Default Changelist" comment="h" />
     <option name="EXCLUDED_CONVERTED_TO_IGNORED" value="true" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -13,14 +10,23 @@
   </component>
   <component name="FileEditorManager">
     <leaf>
-      <file pinned="false" current-in-tab="true">
+      <file pinned="false" current-in-tab="false">
         <entry file="file://$PROJECT_DIR$/grpc/python/ops_wrapper.py">
           <provider selected="true" editor-type-id="text-editor">
-            <state relative-caret-position="375">
-              <caret line="25" column="26" selection-start-line="25" selection-start-column="26" selection-end-line="25" selection-end-column="26" />
+            <state relative-caret-position="405">
+              <caret line="27" lean-forward="true" selection-start-line="27" selection-end-line="27" />
               <folding>
                 <element signature="e#645#683#0" expanded="true" />
               </folding>
+            </state>
+          </provider>
+        </entry>
+      </file>
+      <file pinned="false" current-in-tab="true">
+        <entry file="file://$PROJECT_DIR$/grpc/ops/grpc.cc">
+          <provider selected="true" editor-type-id="text-editor">
+            <state relative-caret-position="448">
+              <caret line="908" column="42" lean-forward="true" selection-start-line="908" selection-start-column="42" selection-end-line="908" selection-end-column="42" />
             </state>
           </provider>
         </entry>
@@ -65,7 +71,7 @@
               <item name="seed_rl_shiraki" type="b2602c69:ProjectViewProjectNode" />
               <item name="seed_rl_shiraki" type="462c0819:PsiDirectoryNode" />
               <item name="grpc" type="462c0819:PsiDirectoryNode" />
-              <item name="python" type="462c0819:PsiDirectoryNode" />
+              <item name="ops" type="462c0819:PsiDirectoryNode" />
             </path>
           </expand>
           <select />
@@ -146,11 +152,18 @@
     </entry>
     <entry file="file://$PROJECT_DIR$/grpc/python/ops_wrapper.py">
       <provider selected="true" editor-type-id="text-editor">
-        <state relative-caret-position="375">
-          <caret line="25" column="26" selection-start-line="25" selection-start-column="26" selection-end-line="25" selection-end-column="26" />
+        <state relative-caret-position="405">
+          <caret line="27" lean-forward="true" selection-start-line="27" selection-end-line="27" />
           <folding>
             <element signature="e#645#683#0" expanded="true" />
           </folding>
+        </state>
+      </provider>
+    </entry>
+    <entry file="file://$PROJECT_DIR$/grpc/ops/grpc.cc">
+      <provider selected="true" editor-type-id="text-editor">
+        <state relative-caret-position="448">
+          <caret line="908" column="42" lean-forward="true" selection-start-line="908" selection-start-column="42" selection-end-line="908" selection-end-column="42" />
         </state>
       </provider>
     </entry>

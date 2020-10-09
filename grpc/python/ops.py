@@ -58,21 +58,15 @@ class Server(object):
     # from being deallocated.
     self._keep_alive = []
 
-  def bind(self, fn):
+  def bind(self, fn, batched=False):
     """Binds a tf.function to the server.
-
-     If the first dimension of all
-     arguments is equal (=N) then batching support is enabled, using N as
-     a batch dimension. In such case when client does a call with a single
-     element (batching dimention skipped), N independent client calls will be
-     batched to construct an input for a single invocation of `fn`.
-     If the signature of parameters provided by the client matches
-     `input_signature`, `fn` is executed immediatelly without batching.
 
     Args:
       fn: The @tf.function wrapped function or a list of such functions, with
         `input_signature` set. When a list of functions is provided,
         they are called in a round-robin manner.
+      batched: If True, the function is batched and the first dimension is the
+        batch dimension.
 
     Returns:
       A tf.Operation.
@@ -83,6 +77,7 @@ class Server(object):
     for i, f in enumerate(fn):
       if f.input_signature is None:
         raise ValueError("tf.function must have input_signature set.")
+
 
       self._keep_alive.append(f.python_function)
 
@@ -106,7 +101,8 @@ class Server(object):
           first_bind=(i == 0),
           input_shapes=input_shapes,
           output_shapes=tf.nest.flatten(f.output_shapes),
-          output_specs=output_specs_proto.SerializeToString())
+          output_specs=output_specs_proto.SerializeToString(),
+          batched=batched)
 
   def start(self):
     return gen_grpc_ops.grpc_server_start(handle=self._handle)
