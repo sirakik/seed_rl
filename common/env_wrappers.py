@@ -1,3 +1,20 @@
+# coding=utf-8
+# Copyright 2019 The SEED Authors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Environment wrappers."""
+
 from absl import flags
 import gym
 import numpy as np
@@ -30,6 +47,7 @@ class UniformBoundActionSpaceWrapper(gym.Wrapper):
 
   def __init__(self, env):
     """Initialize the wrapper.
+
     Args:
       env: Environment to be wrapped. It must have an action space of type
         gym.spaces.Box.
@@ -57,6 +75,7 @@ class DiscretizeEnvWrapper(gym.Env):
   def __init__(self, env, n_actions_per_dim, discretization='lin',
                action_ratio=None):
     """"Discretize actions.
+
     Args:
       env: Environment to be wrapped.
       n_actions_per_dim: The number of buckets per action dimension.
@@ -113,6 +132,7 @@ class BatchedEnvironment:
 
   def __init__(self, create_env_fn, batch_size, id_offset):
     """Initialize the wrapper.
+
     Args:
       create_env_fn: A function to create environment instances.
       batch_size: The number of environment instances to create.
@@ -139,10 +159,12 @@ class BatchedEnvironment:
   @property
   def _mapped_obs(self):
     """Maps observations to preserve the original structure.
+
     This is needed to support environments that return structured observations.
     For example, gym.GoalEnv has `observation`, `desired_goal`, and
     `achieved_goal` elements in its observations. In this case the batched
     observations would contain the same three elements batched by element.
+
     Returns:
       Mapped observations.
     """
@@ -167,9 +189,11 @@ class BatchedEnvironment:
 
   def reset_if_done(self, done):
     """Reset the environments for which 'done' is True.
+
     Args:
       done: An array that specifies which environments are 'done', meaning their
         episode is terminated.
+
     Returns:
       Observations for all environments.
     """
